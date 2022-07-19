@@ -17,6 +17,7 @@ use tui::{
 pub(crate) struct UiSubscriber {
     inner: Arc<Mutex<Inner>>,
     notify: mpsc::Sender<UiDirective>,
+    cur_level: Level,
 }
 
 pub(super) struct Inner {
@@ -28,6 +29,7 @@ impl UiSubscriber {
         Self {
             inner: Arc::new(Mutex::new(Inner { lines: Vec::new() })),
             notify,
+            cur_level: Level::INFO,
         }
     }
 
@@ -38,7 +40,7 @@ impl UiSubscriber {
 
 impl Subscriber for UiSubscriber {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        true
+        metadata.level() <= &self.cur_level
     }
 
     fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {

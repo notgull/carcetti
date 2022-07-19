@@ -1,10 +1,15 @@
 // AGPL v3 License
 
+// we need unsafe code for ffmpeg logging, but aside from that
+// we can go without
+#![deny(unsafe_code)]
+
 use anyhow::{anyhow, Result};
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     process,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -13,11 +18,19 @@ use tokio::{
     task::JoinHandle,
     time::interval,
 };
+use video::{Clip, Video};
 
+mod log;
+mod tempdir;
 mod ui;
+mod video;
 mod video_info;
 
 fn main() {
+    // initialization routines go here
+    ffmpeg::init().expect("failed to initialize ffmpeg");
+    log::register_ffmpeg_logger();
+
     // spawn the tokio runtime
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -33,7 +46,7 @@ fn main() {
 
     // run the main function
     if let Err(e) = runtime.block_on(entry()) {
-        eprintln!("Encountered a fatal error: {}", e);
+        eprintln!("Encountered a fatal error: {:?}", e);
         process::exit(1);
     }
 }
@@ -54,24 +67,64 @@ async fn entry() -> Result<()> {
             })
     });
 
+    let res = processing(&mut send_data, &mut recv_ui).await;
+    if let Err(ref err) = res {
+        tracing::error!("Processing failed: {}", err);
+    }
+
+    // send the stop signals
+    // even if the main system failed, we should let the UI thread
+    // stop gracefully to avoid corrupting the current
+    // terminal env
+    let _ = send_data.send(ui::UiDirective::Stop).await;
+
+    ui_thread.await??;
+
+    res
+}
+
+async fn processing(
+    send_data: &mut mpsc::Sender<ui::UiDirective>,
+    recv_ui: &mut broadcast::Receiver<ui::UiMessage>,
+) -> Result<()> {
+    // open a temporary directory
+    let tempdir = tempdir::TempDir::new().await?;
+
     // open the input file using libav
     let input_file = env::args_os()
         .nth(1)
         .ok_or_else(|| anyhow!("Please provide an input file"))?;
     tracing::info!("Opening file {:?}", input_file);
 
-    let mut video_data = fetch_video_info(input_file.into(), &mut send_data, &mut recv_ui).await?;
+    // create an output file to store the audio
+    let audio_output_file = tempdir.path().join("video-audio.wav");
+
+    let video_data =
+        fetch_video_info(input_file.into(), send_data, recv_ui, audio_output_file).await?;
     tracing::info!("{:?}", video_data);
     tracing::info!(
         "{} motion frames, {} audio frames",
         video_data.frame_motion.len(),
         video_data.audio_volume.len()
     );
+    tracing::info!(
+        "Average Peak Amplitude: {}",
+        video_data
+            .audio_volume
+            .iter()
+            .map(|av| av.average_volume)
+            .sum::<f64>()
+            / video_data.audio_volume.len() as f64
+    );
 
-    // send the stop signals
-    let _ = send_data.send(ui::UiDirective::Stop).await;
+    // make clips for the video
+    let video: Arc<video::Video> = Arc::new(video_data.into());
+    let clips = make_video_clips(&video, send_data, recv_ui).await?;
+    tracing::info!("{} clips", clips.len());
 
-    ui_thread.await??;
+    // destroy the tempdir
+    tempdir.delete().await?;
+    //std::mem::forget(tempdir);
 
     Ok(())
 }
@@ -80,14 +133,34 @@ async fn fetch_video_info(
     input_file: PathBuf,
     send_data: &mut mpsc::Sender<ui::UiDirective>,
     ui_data: &mut broadcast::Receiver<ui::UiMessage>,
+    audio_output: PathBuf,
 ) -> Result<video_info::VideoInfo> {
     // tell the UI thread that we're loading video info
     let _ui_guard = spawn_ellipses_task(send_data, "Processing video file");
 
     // get the video info
     let handle = tokio::task::spawn_blocking(move || {
-        video_info::video_info(&input_file).map_err(|e| {
+        video_info::video_info(&input_file, audio_output).map_err(|e| {
             tracing::error!("Failed to parse video info: {}", e);
+            e
+        })
+    });
+
+    finish_task(handle, ui_data).await?
+}
+
+async fn make_video_clips(
+    video: &Arc<Video>,
+    send_data: &mut mpsc::Sender<ui::UiDirective>,
+    ui_data: &mut broadcast::Receiver<ui::UiMessage>,
+) -> Result<Vec<Clip>> {
+    let _ui_guard = spawn_ellipses_task(send_data, "Processing video into clips");
+
+    let video = video.clone();
+
+    let handle = tokio::task::spawn_blocking(move || {
+        video.make_clips(1.0, 1_000_000, 1.1).map_err(|e| {
+            tracing::error!("Failed to make clips: {}", e);
             e
         })
     });
