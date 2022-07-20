@@ -3,6 +3,7 @@
 use super::UiDirective;
 use sharded_slab::Slab;
 use std::{
+    iter::empty,
     mem,
     sync::{Arc, Mutex},
 };
@@ -89,6 +90,12 @@ impl Subscriber for UiSubscriber {
             Err(_) => return,
         };
         inner.lines.push(Spans(spans));
+
+        // every 1k events, truncate the last 750 events
+        if inner.lines.len() > 1000 {
+            inner.lines.drain(..750);
+        }
+
         mem::drop(inner);
 
         // send a notification to the UI to refresh

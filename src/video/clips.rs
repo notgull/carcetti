@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use std::cmp;
 
 /// A clip in a video.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Clip {
     /// Start in microseconds.
     pub(crate) start: i64,
@@ -16,6 +16,12 @@ pub(crate) struct Clip {
     /// "Priority" of the clip, determined by relatively volume
     /// and image motion.
     pub(crate) priority: f64,
+}
+
+impl Clip {
+    pub(crate) fn len(self) -> i64 {
+        self.end - self.start + 1
+    }
 }
 
 /// From a `Video`, determine what parts should be clipped.
@@ -201,9 +207,11 @@ impl Clipset {
         while i < self.clips.len() {
             // if this clip and the next one add up to less than 750 ms,
             // merge them together
+            // also merge if this clip is exceptionally short
             if i + 1 < self.clips.len() {
                 let next_clip = self.clips[i + 1];
-                if self.clips[i].len() + next_clip.len() < 750_000 {
+                if self.clips[i].len() + next_clip.len() < 750_000 || self.clips[i].len() < 100_000
+                {
                     self.clips[i].merge_from(next_clip);
                     self.clips.remove(i + 1);
                 }

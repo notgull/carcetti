@@ -7,23 +7,34 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
+    cmp,
+    collections::HashSet,
+    fmt,
     io::{self, Write},
+    iter::repeat,
     process,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, RwLock},
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame, Terminal,
 };
 
+use crate::{
+    video::{Clip, Video},
+    VideoConfig,
+};
+use textbox::{TextBox, TextBoxState};
+
 mod subscriber;
+mod textbox;
 
 /// Run the UI thread.
 ///
@@ -105,6 +116,8 @@ async fn run_ui<B: Backend + Send + 'static>(
     let mut state = DrawState {
         last_directive,
         tracing_events: span_events,
+        table_state: None,
+        video_config: None,
     };
 
     let mut running = true;
@@ -146,6 +159,24 @@ async fn run_ui<B: Backend + Send + 'static>(
                         });
 
                         return Err(anyhow!("User requested exit"));
+                    } else if key.code == KeyCode::Up {
+                        state.on_up();
+                    } else if key.code == KeyCode::Down {
+                        state.on_down();
+                    } else if key.code == KeyCode::Enter {
+                        if let Some(msg) = state.on_enter()? {
+                            ui_data.send(msg)?;
+                        }
+                    } else if key.code == KeyCode::Esc && state.on_esc() {
+                        running = false;
+                        ui_data.send(UiMessage::Halt).ok();
+                        return Ok(());
+                    } else if let KeyCode::Char(c) = key.code {
+                        if let Some(msg) = state.on_char(c) {
+                            ui_data.send(msg)?;
+                        }
+                    } else if key.code == KeyCode::Backspace {
+                        state.on_backspace();
                     }
                 }
             }
@@ -171,14 +202,162 @@ fn draw_ui(frame: &mut Frame<'_, impl Backend>, state: &mut DrawState) {
         frame.render_widget(p, chunks[0]);
     };
 
-    match &state.last_directive {
+    match &mut state.last_directive {
         UiDirective::Stop => {
             do_string("Press any key to continue...");
         }
         UiDirective::DisplayText(text) => {
             do_string(text);
         }
-        UiDirective::Refresh => {}
+        UiDirective::Refresh => panic!("Directive should never be refresh"),
+        UiDirective::Clips { clips, indices, .. } => {
+            let table_state = state.table_state.get_or_insert_with(|| {
+                let mut ts = TableState::default();
+                ts.select(Some(0));
+                ts
+            });
+
+            let table_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(0)
+                .constraints([Constraint::Length(5), Constraint::Max(9999)])
+                .split(chunks[0]);
+
+            // populate with clips
+            let mut total_time = 0;
+            let indices = indices.read().unwrap();
+            let rows = clips
+                .iter()
+                .enumerate()
+                .map(|(index, clip)| {
+                    let is_active = indices.contains(&index);
+                    if is_active {
+                        total_time += clip.len();
+                    }
+
+                    Row::new([
+                        Cell::from(format!(
+                            "{} - {}",
+                            Timestamp(clip.start),
+                            Timestamp(clip.end)
+                        )),
+                        Cell::from(Timestamp(clip.len()).to_string()),
+                        if is_active {
+                            Cell::from("ACTIVE").style(Style::default().fg(Color::Green))
+                        } else {
+                            Cell::from("INACTIVE").style(Style::default().fg(Color::Red))
+                        },
+                    ])
+                })
+                .collect::<Vec<_>>();
+
+            let instructions = Paragraph::new(vec![
+                Spans::from("Select clips to produce a video"),
+                Spans::from(
+                    "Enter to change status, C to reconfigure, Spacebar to continue, Esc to exit",
+                ),
+                Spans::from(format!("Current time: {}", Timestamp(total_time))),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("Instructions"));
+
+            let table = Table::new(rows)
+                .widths(&[
+                    Constraint::Length(32),
+                    Constraint::Length(15),
+                    Constraint::Length(10),
+                ])
+                .column_spacing(1)
+                .block(Block::default().title("Clips").borders(Borders::ALL))
+                .header(
+                    Row::new(["Range", "Duration", "Status"]).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                );
+
+            frame.render_widget(instructions, table_layout[0]);
+            frame.render_stateful_widget(table, table_layout[1], table_state);
+        }
+        UiDirective::ModifyVideoConfig(ref mut config) => {
+            // create the config state if it doesn't exist already
+            let cfg_state = state.video_config.get_or_insert_with(|| {
+                let time_to_float_seconds = |time| (time as f64) / 1_000_000.0;
+
+                let mut buffer = ryu::Buffer::new();
+                let mut sil_th =
+                    TextBoxState::new(buffer.format(config.silence_threshold).to_string());
+                let sil_ti = TextBoxState::new(
+                    buffer
+                        .format(time_to_float_seconds(config.silence_time))
+                        .to_string(),
+                );
+                let sil_deg = TextBoxState::new(buffer.format(config.silence_degrade).to_string());
+                let tim_lim = TextBoxState::new(
+                    buffer
+                        .format(time_to_float_seconds(config.time_limit))
+                        .to_string(),
+                );
+                sil_th.focus(true);
+
+                VideoConfigState {
+                    textboxes: [sil_th, sil_ti, sil_deg, tim_lim],
+                    focused: 0,
+                }
+            });
+
+            let bl = Block::default()
+                .borders(Borders::ALL)
+                .title("Configuration");
+            frame.render_widget(bl, chunks[0]);
+
+            let inner_rect = Rect {
+                x: chunks[0].x + 1,
+                y: chunks[0].y + 1,
+                width: chunks[0].width - 2,
+                height: chunks[0].height - 2,
+            };
+
+            let tb_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(3)
+                .constraints(
+                    repeat(Constraint::Percentage(20))
+                        .take(5)
+                        .collect::<Vec<_>>(),
+                )
+                .split(inner_rect);
+
+            for (i, header) in [
+                "Silence Threshold",
+                "Silence Time (seconds)",
+                "Silence Degradation",
+                "Time Limit (seconds)",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let tb = TextBox::default().header(*header);
+
+                frame.render_stateful_widget(tb, tb_layout[i], &mut cfg_state.textboxes[i]);
+            }
+
+            // render instructions as well
+            let inst = Paragraph::new(
+                "Press Enter to apply changes, up/down to change focus, Esc to exit",
+            )
+            .style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::ITALIC),
+            );
+            frame.render_widget(inst, tb_layout[4]);
+        }
     }
 
     let height = chunks[1].height - 2;
@@ -199,6 +378,156 @@ fn draw_ui(frame: &mut Frame<'_, impl Backend>, state: &mut DrawState) {
 struct DrawState {
     last_directive: UiDirective,
     tracing_events: Arc<Mutex<subscriber::Inner>>,
+    table_state: Option<TableState>,
+    video_config: Option<VideoConfigState>,
+}
+
+struct VideoConfigState {
+    textboxes: [TextBoxState; 4],
+    focused: usize,
+}
+
+impl DrawState {
+    /// The "up" key was pressed.
+    fn on_up(&mut self) {
+        if let (UiDirective::Clips { .. }, Some(ts)) =
+            (&self.last_directive, self.table_state.as_mut())
+        {
+            ts.select(ts.selected().map(|s| s.saturating_sub(1)));
+        } else if let (UiDirective::ModifyVideoConfig(..), Some(vc)) =
+            (&self.last_directive, self.video_config.as_mut())
+        {
+            vc.textboxes[vc.focused].focus(false);
+            vc.focused = vc.focused.saturating_sub(1);
+            vc.textboxes[vc.focused].focus(true);
+        }
+    }
+
+    /// The "down" key was pressed.
+    fn on_down(&mut self) {
+        if let (UiDirective::Clips { clips, .. }, Some(ts)) =
+            (&self.last_directive, self.table_state.as_mut())
+        {
+            ts.select(ts.selected().map(|s| {
+                let new_s = s.saturating_add(1);
+                cmp::min(new_s, clips.len() - 1)
+            }));
+        } else if let (UiDirective::ModifyVideoConfig(..), Some(vc)) =
+            (&self.last_directive, self.video_config.as_mut())
+        {
+            vc.textboxes[vc.focused].focus(false);
+            vc.focused = vc.focused.saturating_add(1);
+            vc.focused = cmp::min(vc.focused, vc.textboxes.len() - 1);
+            vc.textboxes[vc.focused].focus(true);
+        }
+    }
+
+    /// The "enter" key was pressed.
+    fn on_enter(&mut self) -> Result<Option<UiMessage>> {
+        if let (UiDirective::Clips { clips, indices, .. }, Some(ts)) =
+            (&self.last_directive, self.table_state.as_mut())
+        {
+            let selected = ts.selected().unwrap();
+            let mut indices = indices.write().unwrap();
+            if indices.contains(&selected) {
+                indices.remove(&selected);
+            } else {
+                indices.insert(selected);
+            }
+        } else if let (UiDirective::ModifyVideoConfig(..), Some(vc)) =
+            (&self.last_directive, self.video_config.as_mut())
+        {
+            let float_seconds_to_time = |f| (f * 1_000_000.0) as i64;
+
+            // parse the values as floats
+            let mut values = [0.0; 4];
+            for i in 0..4 {
+                let text = vc.textboxes[i].text();
+                let value = text
+                    .parse::<f64>()
+                    .map_err(|_| anyhow!("could not parse {} as a float", text))?;
+                values[i] = value;
+            }
+            let config = VideoConfig {
+                silence_threshold: values[0],
+                silence_time: float_seconds_to_time(values[1]),
+                silence_degrade: values[2],
+                time_limit: float_seconds_to_time(values[3]),
+            };
+
+            return Ok(Some(UiMessage::RerunVideoProcess(config)));
+        }
+
+        Ok(None)
+    }
+
+    /// The "esc" key was pressed.
+    ///
+    /// Returns true if the program should exit.
+    fn on_esc(&mut self) -> bool {
+        if let UiDirective::Clips { .. } | UiDirective::ModifyVideoConfig(..) = &self.last_directive
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// A character was pressed.
+    ///
+    /// If a UI message is needed, it returns it.
+    fn on_char(&mut self, c: char) -> Option<UiMessage> {
+        match c {
+            ' ' => match self.last_directive {
+                UiDirective::Clips { .. } => Some(UiMessage::GoForIt),
+                _ => None,
+            },
+            'c' => match self.last_directive {
+                UiDirective::Clips { ref config, .. } => {
+                    self.last_directive = UiDirective::ModifyVideoConfig(config.clone());
+                    None
+                }
+                UiDirective::ModifyVideoConfig(..) => {
+                    self.video_config.as_mut().unwrap().on_char('c')
+                }
+                _ => None,
+            },
+            c => match self.last_directive {
+                UiDirective::ModifyVideoConfig(_) => self.video_config.as_mut().unwrap().on_char(c),
+                _ => None,
+            },
+        }
+    }
+
+    /// Backspace was pressed.
+    fn on_backspace(&mut self) {
+        match self.last_directive {
+            UiDirective::ModifyVideoConfig(_) => self.video_config.as_mut().unwrap().on_backspace(),
+            _ => (),
+        }
+    }
+}
+
+impl VideoConfigState {
+    fn on_char(&mut self, c: char) -> Option<UiMessage> {
+        match c {
+            '\n' => {
+                // ignore it
+            }
+            _ => {
+                if let Some(textbox) = self.textboxes.iter_mut().find(|tb| tb.focused()) {
+                    textbox.push(c);
+                }
+            }
+        }
+        None
+    }
+
+    fn on_backspace(&mut self) {
+        if let Some(textbox) = self.textboxes.iter_mut().find(|tb| tb.focused()) {
+            textbox.pop();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -209,10 +538,48 @@ pub(crate) enum UiDirective {
     Stop,
     /// We just need to refresh.
     Refresh,
+    /// Request the UI display the screen containing
+    /// the clips and valid clips.
+    Clips {
+        clips: Arc<[Clip]>,
+        indices: Arc<RwLock<HashSet<usize>>>,
+        config: VideoConfig,
+    },
+    /// Edit and modify the video config.
+    ModifyVideoConfig(VideoConfig),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum UiMessage {
     /// Halt the program as gracefully as possible.
     Halt,
+    /// Rerun the video processing algorithm with the given configuration.
+    RerunVideoProcess(VideoConfig),
+    /// Begin processing the video with the given config.
+    GoForIt,
+}
+
+/// Internal value is in microseconds.
+struct Timestamp(i64);
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // value is in microseconds
+        let mut value = self.0;
+        let microseconds = value % 1000;
+        value /= 1000;
+        let milliseconds = value % 1000;
+        value /= 1000;
+        let seconds = value % 60;
+        value /= 60;
+        let minutes = value % 60;
+        value /= 60;
+        let hours = value;
+
+        write!(
+            f,
+            "{:02}:{:02}:{:02}.{:03}",
+            hours, minutes, seconds, milliseconds
+        )
+    }
 }

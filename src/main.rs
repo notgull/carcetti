@@ -6,21 +6,23 @@
 
 use anyhow::{anyhow, Result};
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::{
     spawn,
     sync::{broadcast, mpsc},
-    task::JoinHandle,
+    task::{JoinError, JoinHandle},
     time::interval,
 };
 use video::{Clip, Video};
 
 mod log;
+mod sort_clips;
 mod tempdir;
 mod ui;
 mod video;
@@ -47,10 +49,27 @@ fn main() {
     // run the main function
     if let Err(e) = runtime.block_on(entry()) {
         eprintln!("Encountered a fatal error: {:?}", e);
+
+        // if it's a join panic, resume it
+        if let Ok(jh) = e.downcast::<JoinError>() {
+            if let Ok(pn) = jh.try_into_panic() {
+                match pn.downcast::<String>() {
+                    Ok(s) => eprintln!("Panic message: {}", s),
+                    Err(pn) => {
+                        if let Ok(s) = pn.downcast::<&'static str>() {
+                            eprintln!("Panic message: {}", s);
+                        }
+                    }
+                }
+            }
+        }
+
         process::exit(1);
     }
 }
 
+/// Intended to wrap the real main function (`processing`) with
+/// a terminal UI.
 async fn entry() -> Result<()> {
     // spawn the terminal UI thread
     let (mut send_data, recv_data) = mpsc::channel(10);
@@ -68,6 +87,7 @@ async fn entry() -> Result<()> {
     });
 
     let res = processing(&mut send_data, &mut recv_ui).await;
+    tracing::info!("Reached end of processing execution");
     if let Err(ref err) = res {
         tracing::error!("Processing failed: {}", err);
     }
@@ -119,8 +139,48 @@ async fn processing(
 
     // make clips for the video
     let video: Arc<video::Video> = Arc::new(video_data.into());
-    let clips = make_video_clips(&video, send_data, recv_ui).await?;
-    tracing::info!("{} clips", clips.len());
+    let mut video_config = VideoConfig {
+        silence_threshold: 1.0,
+        silence_degrade: 1.1,
+        silence_time: 1_000_000,
+        time_limit: 15_000_000,
+    };
+
+    let process_video = loop {
+        let clips = make_video_clips(&video, &video_config, send_data, recv_ui).await?;
+        tracing::info!("{} clips", clips.len());
+        let clips: Arc<[Clip]> = clips.into_boxed_slice().into();
+
+        // sort the clips
+        let valid_clip_indices =
+            sort_video_clips(&clips, &video_config, send_data, recv_ui).await?;
+        tracing::info!("Retained {} clips", valid_clip_indices.len());
+        let indices = Arc::new(RwLock::new(valid_clip_indices));
+
+        // send the clips to the UI thread
+        send_data
+            .send(ui::UiDirective::Clips {
+                clips: clips.clone(),
+                indices: indices.clone(),
+                config: video_config.clone(),
+            })
+            .await?;
+
+        // wait for a UI response
+        let ui_response = recv_ui.recv().await?;
+
+        match ui_response {
+            ui::UiMessage::Halt => break false,
+            ui::UiMessage::RerunVideoProcess(vc) => {
+                video_config = vc;
+            }
+            ui::UiMessage::GoForIt => break true,
+        }
+    };
+
+    if process_video {
+        tracing::info!("Processing video...");
+    }
 
     // destroy the tempdir
     tempdir.delete().await?;
@@ -151,21 +211,45 @@ async fn fetch_video_info(
 
 async fn make_video_clips(
     video: &Arc<Video>,
+    video_config: &VideoConfig,
     send_data: &mut mpsc::Sender<ui::UiDirective>,
     ui_data: &mut broadcast::Receiver<ui::UiMessage>,
 ) -> Result<Vec<Clip>> {
     let _ui_guard = spawn_ellipses_task(send_data, "Processing video into clips");
 
     let video = video.clone();
+    let VideoConfig {
+        silence_threshold,
+        silence_time,
+        silence_degrade,
+        ..
+    } = video_config.clone();
 
     let handle = tokio::task::spawn_blocking(move || {
-        video.make_clips(1.0, 1_000_000, 1.1).map_err(|e| {
-            tracing::error!("Failed to make clips: {}", e);
-            e
-        })
+        video
+            .make_clips(silence_threshold, silence_time, silence_degrade)
+            .map_err(|e| {
+                tracing::error!("Failed to make clips: {}", e);
+                e
+            })
     });
 
     finish_task(handle, ui_data).await?
+}
+
+async fn sort_video_clips(
+    clips: &Arc<[Clip]>,
+    config: &VideoConfig,
+    send_data: &mut mpsc::Sender<ui::UiDirective>,
+    ui_data: &mut broadcast::Receiver<ui::UiMessage>,
+) -> Result<HashSet<usize>> {
+    let _ui_guard = spawn_ellipses_task(send_data, "Sorting video clips into sequences");
+
+    let clips = clips.clone();
+    let time_limit = config.time_limit;
+    let handle = tokio::task::spawn_blocking(move || sort_clips::sort_clips(&clips, time_limit));
+
+    Ok(finish_task(handle, ui_data).await?)
 }
 
 /// Begin a message that has an ellipses after it.
@@ -239,4 +323,12 @@ async fn finish_task<J>(
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct VideoConfig {
+    silence_threshold: f64,
+    silence_time: i64,
+    silence_degrade: f64,
+    time_limit: i64,
 }
