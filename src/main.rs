@@ -17,7 +17,7 @@ use tempdir::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::{RwLock, broadcast, mpsc},
+    sync::{broadcast, mpsc, RwLock},
     task::{JoinError, JoinHandle},
     time::interval,
 };
@@ -387,7 +387,7 @@ async fn make_video_clips(
 
     let handle = tokio::task::spawn_blocking(move || {
         video
-            .make_clips(silence_threshold, silence_time, silence_degrade)
+            .make_clips(silence_threshold, silence_time, silence_degrade, 0.1)
             .map_err(|e| {
                 tracing::error!("Failed to make clips: {}", e);
                 e

@@ -7,11 +7,7 @@ use quick_xml::{
     events::{attributes::Attribute, BytesDecl, BytesEnd, BytesStart, Event},
     Writer,
 };
-use std::{
-    convert::TryInto,
-    fs, io,
-    path::Path,
-};
+use std::{convert::TryInto, fs, io, path::Path};
 
 mod playlist;
 mod producer;

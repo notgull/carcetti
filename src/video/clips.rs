@@ -29,6 +29,7 @@ pub(crate) fn clip_video(
     silence_threshold: f64,
     silence_time: i64,
     silence_time_degradation: f64,
+    borrow_factor: f64,
 ) -> Result<Vec<Clip>> {
     // clip up the video
     let clips = Clipset::of(
@@ -44,10 +45,14 @@ pub(crate) fn clip_video(
     getrandom::getrandom(bytemuck::bytes_of_mut(&mut seed))?;
     let rng = Rng::with_seed(seed);
 
-    clips
+    let mut clips = clips
         .into_iter()
         .map(|c| c.prioritize(video, &rng))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    priority_borrowing(&mut clips, borrow_factor, 3);
+
+    Ok(clips)
 }
 
 #[derive(Debug, Clone)]
@@ -271,4 +276,27 @@ impl UnprioritizedClip {
             priority,
         })
     }
+}
+
+/// Set clips up such that their priorities are partially determined
+/// by other, adjacent clips.
+fn priority_borrowing(clips: &mut [Clip], borrow_factor: f64, distance: usize) {
+    let mut after_borrow = vec![0f64; clips.len()];
+    #[allow(clippy::needless_range_loop)] 
+    for i in 0..clips.len() {
+        let mut borrowed = 0.0;
+        for j in (i.saturating_sub(distance))..(i + distance) {
+            if j < clips.len() {
+                borrowed += clips[j].priority;
+            }
+        }
+        after_borrow[i] = borrowed as f64 * borrow_factor;
+    }
+
+    clips
+        .iter_mut()
+        .zip(after_borrow.into_iter())
+        .for_each(|(clip, new_priority)| {
+            clip.priority = new_priority;
+        });
 }

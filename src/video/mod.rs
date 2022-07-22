@@ -22,12 +22,14 @@ impl Video {
         silence_threshold: f64,
         silence_time: i64,
         silence_time_degradation: f64,
+        borrow_factor: f64,
     ) -> Result<Vec<clips::Clip>> {
         clips::clip_video(
             self,
             silence_threshold,
             silence_time,
             silence_time_degradation,
+            borrow_factor,
         )
     }
 }

@@ -27,10 +27,7 @@ use tui::{
     Frame, Terminal,
 };
 
-use crate::{
-    video::Clip,
-    VideoConfig,
-};
+use crate::{video::Clip, VideoConfig};
 use textbox::{TextBox, TextBoxState};
 
 mod subscriber;
