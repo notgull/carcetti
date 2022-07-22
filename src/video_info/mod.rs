@@ -36,6 +36,9 @@ pub(crate) struct VideoInfo {
     pub audio_timebase: f64,
     pub frame_motion: Vec<ImageMotion>,
     pub audio_volume: Vec<AudioVolume>,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
 }
 
 impl fmt::Debug for VideoInfo {
@@ -74,7 +77,12 @@ pub(crate) fn video_info(path: impl AsRef<Path>, audio_output: PathBuf) -> Resul
     let mut video_handles = vec![];
 
     // spawn a thread to decode video packets
-    let handle = spawn_video_thread(&video, &recv_video_packets)?;
+    let mut video_decoder = video.codec().decoder().video()?;
+    let (width, height) = (video_decoder.width(), video_decoder.height());
+    let fps = video_decoder
+        .frame_rate()
+        .ok_or_else(|| anyhow!("Could not get video frame rate"))?;
+    let handle = spawn_video_thread(video_decoder, &recv_video_packets)?;
     video_handles.push(handle);
 
     // spawn a thread to encode audio packets and save them in our temp
@@ -163,11 +171,14 @@ pub(crate) fn video_info(path: impl AsRef<Path>, audio_output: PathBuf) -> Resul
         audio_timebase: rational_to_float(&audio_timebase),
         frame_motion: motions,
         audio_volume: volumes,
+        width,
+        height,
+        frame_rate: rational_to_float(&fps),
     })
 }
 
 fn spawn_video_thread(
-    stream: &Stream,
+    mut video_decoder: VideoDecoder,
     recv_video_packets: &Receiver<Packet>,
 ) -> Result<JoinHandle<Result<Vec<ImageMotion>>>> {
     static ID: AtomicUsize = AtomicUsize::new(0);
@@ -175,7 +186,6 @@ fn spawn_video_thread(
 
     // create the decoder
     let recv_video_packets = recv_video_packets.clone();
-    let mut video_decoder = stream.codec().decoder().video()?;
 
     let mut scaler = Context::get(
         video_decoder.format(),

@@ -7,13 +7,16 @@
 use anyhow::{anyhow, Result};
 use std::{
     collections::HashSet,
-    env, fs,
+    env, fs, mem,
     path::{Path, PathBuf},
-    process,
+    process::{self, Stdio},
     sync::{Arc, RwLock},
     time::Duration,
 };
+use tempdir::TempDir;
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
     spawn,
     sync::{broadcast, mpsc},
     task::{JoinError, JoinHandle},
@@ -22,6 +25,7 @@ use tokio::{
 use video::{Clip, Video};
 
 mod log;
+mod melt;
 mod sort_clips;
 mod tempdir;
 mod ui;
@@ -100,7 +104,7 @@ async fn entry() -> Result<()> {
 
     ui_thread.await??;
 
-    res
+    Ok(())
 }
 
 async fn processing(
@@ -119,8 +123,13 @@ async fn processing(
     // create an output file to store the audio
     let audio_output_file = tempdir.path().join("video-audio.wav");
 
-    let video_data =
-        fetch_video_info(input_file.into(), send_data, recv_ui, audio_output_file).await?;
+    let video_data = fetch_video_info(
+        input_file.clone().into(),
+        send_data,
+        recv_ui,
+        audio_output_file,
+    )
+    .await?;
     tracing::info!("{:?}", video_data);
     tracing::info!(
         "{} motion frames, {} audio frames",
@@ -170,21 +179,173 @@ async fn processing(
         let ui_response = recv_ui.recv().await?;
 
         match ui_response {
-            ui::UiMessage::Halt => break false,
+            ui::UiMessage::Halt => break None,
             ui::UiMessage::RerunVideoProcess(vc) => {
                 video_config = vc;
             }
-            ui::UiMessage::GoForIt => break true,
+            ui::UiMessage::GoForIt => break Some((clips, indices)),
         }
     };
 
-    if process_video {
+    if let Some((clips, used_indices)) = process_video {
         tracing::info!("Processing video...");
+        let video_path = make_melt_xml(
+            video,
+            input_file.into(),
+            clips,
+            used_indices,
+            &tempdir,
+            send_data,
+        )
+        .await?;
+
+        run_melt(video_path, &tempdir, send_data, recv_ui).await?;
     }
 
     // destroy the tempdir
-    tempdir.delete().await?;
-    //std::mem::forget(tempdir);
+    if env::args().any(|a| a == "--keep-temp") {
+        tracing::info!("Keeping temporary directory");
+        mem::forget(tempdir);
+    } else {
+        tracing::info!("Removing temporary directory");
+        tempdir.delete().await?;
+    }
+
+    Ok(())
+}
+
+async fn make_melt_xml(
+    video: Arc<Video>,
+    input_file: PathBuf,
+    clips: Arc<[Clip]>,
+    used_indices: Arc<RwLock<HashSet<usize>>>,
+    tempdir: &TempDir,
+    send_data: &mut mpsc::Sender<ui::UiDirective>,
+) -> Result<PathBuf> {
+    const SOURCE_NAME: &str = "source";
+    const MAIN_PLAYLIST_NAME: &str = "main_video";
+    const MAIN_TRACTOR_NAME: &str = "main_tractor";
+
+    let _ui_guard = spawn_ellipses_task(send_data, "Creating video configuration");
+
+    // begin running MELT
+    let video_path = env::args_os()
+        .nth(2)
+        .or_else(|| {
+            let vd = dirs::video_dir()?;
+            Some(vd.join("video.webm").into())
+        })
+        .ok_or_else(|| anyhow!("Please provide a video output path"))?;
+    let melt_path = tempdir.path().join("assembly.xml");
+
+    let indices = used_indices.read().unwrap();
+    let duration = clips
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| indices.contains(i))
+        .map(|(_, c)| c.len())
+        .sum();
+    let duration = microseconds_to_frames(duration, video.fps);
+    let mut melt = melt::Melt::new(&melt_path, video_path.as_ref(), &video, duration)?;
+
+    // add the source video as a producer
+    melt.producer(&input_file, SOURCE_NAME)?;
+
+    // add the clips into a giant playlist
+    melt.playlist(
+        clips
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| indices.contains(i))
+            .map(|(_, clip)| {
+                // determine the start and end
+                let start = microseconds_to_frames(clip.start, video.fps);
+                let end = microseconds_to_frames(clip.end, video.fps);
+
+                melt::PlaylistItem::Entry {
+                    id: SOURCE_NAME,
+                    start,
+                    end,
+                }
+            }),
+        MAIN_PLAYLIST_NAME,
+    )?;
+    drop(indices);
+
+    // TODO: music
+
+    // create a tractor made up of the playlist
+    melt.tractor(Some(MAIN_PLAYLIST_NAME), MAIN_TRACTOR_NAME)?;
+
+    // now, render the video to the MLT file
+    melt.write_file(MAIN_TRACTOR_NAME).await?;
+
+    Ok(melt_path)
+}
+
+async fn run_melt(
+    video_file: PathBuf,
+    tempdir: &TempDir,
+    send_data: &mut mpsc::Sender<ui::UiDirective>,
+    ui_data: &mut broadcast::Receiver<ui::UiMessage>,
+) -> Result<()> {
+    let _ui_guard = spawn_ellipses_task(send_data, "Running MELT (this may take a while)");
+    let mut melt = Command::new("melt")
+        .current_dir(tempdir.path())
+        .arg(video_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let mut stdout = BufReader::new(melt.stdout.take().unwrap());
+    let mut stderr = BufReader::new(melt.stderr.take().unwrap());
+    let mut outbuffer = String::new();
+    let mut errbuffer = String::new();
+
+    // BEGIN PROCESSING THE MELT OUTPUT
+    tracing::info!("Starting MELT...");
+    loop {
+        tokio::select! {
+            res = melt.wait() => {
+                res?;
+                break;
+            },
+            msg = ui_data.recv() => {
+                if let ui::UiMessage::Halt = msg? {
+                    melt.kill().await?;
+                    break;
+                }
+            },
+            res = stdout.read_line(&mut outbuffer) => {
+                res?;
+                tracing::info!("{}", &outbuffer);
+                outbuffer.clear();
+            },
+            res = stderr.read_line(&mut errbuffer) => {
+                res?;
+                tracing::error!("{}", &errbuffer);
+                errbuffer.clear();
+            }
+        }
+    }
+
+    // drain the buffers before we return
+    while stdout.read_line(&mut outbuffer).await.is_ok() {
+        if outbuffer.is_empty() {
+            break;
+        }
+        tracing::info!("{}", &outbuffer);
+        outbuffer.clear();
+    }
+
+    while stderr.read_line(&mut errbuffer).await.is_ok() {
+        if errbuffer.is_empty() {
+            break;
+        }
+        tracing::error!("{}", &errbuffer);
+        errbuffer.clear();
+    }
 
     Ok(())
 }
@@ -331,4 +492,9 @@ struct VideoConfig {
     silence_time: i64,
     silence_degrade: f64,
     time_limit: i64,
+}
+
+#[inline]
+fn microseconds_to_frames(microseconds: i64, fps: f64) -> i64 {
+    (microseconds as f64 / 1_000_000.0 * fps).round() as i64
 }

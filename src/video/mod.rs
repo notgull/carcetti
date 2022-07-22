@@ -11,6 +11,10 @@ pub(crate) use clips::Clip;
 pub(crate) struct Video {
     pub(crate) volumes: Vec<Volume>,
     pub(crate) frames: Vec<Frame>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) fps: f64,
+    pub(crate) duration: i64,
 }
 
 impl Video {
@@ -47,7 +51,21 @@ impl From<VideoInfo> for Video {
             audio_timebase,
             frame_motion,
             audio_volume,
+            width,
+            height,
+            frame_rate,
         } = info;
+
+        let duration = frame_motion
+            .iter()
+            .map(|fm| pts_to_microseconds(fm.timestamp, video_timebase))
+            .chain(
+                audio_volume
+                    .iter()
+                    .map(|av| pts_to_microseconds(av.timestamp, audio_timebase)),
+            )
+            .max()
+            .unwrap_or(0);
 
         Video {
             volumes: audio_volume
@@ -63,6 +81,10 @@ impl From<VideoInfo> for Video {
                     microseconds: pts_to_microseconds(fm.timestamp, video_timebase),
                 })
                 .collect(),
+            width,
+            height,
+            fps: frame_rate,
+            duration,
         }
     }
 }

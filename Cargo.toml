@@ -6,14 +6,17 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.58"
 bytemuck = "1.10.0"
+camino = "1.0.9"
 coqui-stt = "1.0.2"
 crossbeam-channel = "0.5.5"
 crossterm = { version = "0.24.0", features = ["event-stream"] }
+dirs = "4.0.0"
 fastrand = "1.7.0"
 ffmpeg = { git = "https://github.com/meh/rust-ffmpeg.git" }
 getrandom = { version = "0.2.7", features = ["std"] }
 image = { version = "0.24.2", default-features = false }
 ordered-float = "3.0.0"
+quick-xml = "0.23.0"
 rayon = "1.5.3"
 ryu = "1.0.10"
 sharded-slab = "0.1.4"

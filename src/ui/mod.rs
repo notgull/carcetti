@@ -118,6 +118,7 @@ async fn run_ui<B: Backend + Send + 'static>(
         tracing_events: span_events,
         table_state: None,
         video_config: None,
+        tracing_toggle: false,
     };
 
     let mut running = true;
@@ -185,10 +186,15 @@ async fn run_ui<B: Backend + Send + 'static>(
 }
 
 fn draw_ui(frame: &mut Frame<'_, impl Backend>, state: &mut DrawState) {
+    let ctrs = if state.tracing_toggle {
+        [Constraint::Percentage(5), Constraint::Percentage(95)]
+    } else {
+        [Constraint::Percentage(80), Constraint::Percentage(20)]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([Constraint::Percentage(80), Constraint::Percentage(20)].as_ref())
+        .constraints(&ctrs)
         .split(frame.size());
 
     let mut do_string = |s: &str| {
@@ -380,6 +386,7 @@ struct DrawState {
     tracing_events: Arc<Mutex<subscriber::Inner>>,
     table_state: Option<TableState>,
     video_config: Option<VideoConfigState>,
+    tracing_toggle: bool,
 }
 
 struct VideoConfigState {
@@ -492,6 +499,10 @@ impl DrawState {
                 }
                 _ => None,
             },
+            't' => {
+                self.tracing_toggle = !self.tracing_toggle;
+                None
+            }
             c => match self.last_directive {
                 UiDirective::ModifyVideoConfig(_) => self.video_config.as_mut().unwrap().on_char(c),
                 _ => None,
