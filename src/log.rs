@@ -10,7 +10,6 @@ use std::{
     mem,
     os::raw::{c_char, c_int},
 };
-use tracing::Level;
 use vsprintf::vsprintf;
 
 /// Register the logging callback with FFMPEG.
@@ -22,7 +21,7 @@ pub(crate) fn register_ffmpeg_logger() {
 
 /// The callback that forwards to tracing.
 unsafe extern "C" fn log_callback(
-    class: *mut c_void,
+    _class: *mut c_void,
     level: c_int,
     format: *const c_char,
     va_list: *mut sys::__va_list_tag,

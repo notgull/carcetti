@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use std::{
-    env, mem,
+    env,
     path::{Path, PathBuf},
 };
 use tokio::fs;

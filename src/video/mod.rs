@@ -14,7 +14,6 @@ pub(crate) struct Video {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) fps: f64,
-    pub(crate) duration: i64,
 }
 
 impl Video {
@@ -56,17 +55,6 @@ impl From<VideoInfo> for Video {
             frame_rate,
         } = info;
 
-        let duration = frame_motion
-            .iter()
-            .map(|fm| pts_to_microseconds(fm.timestamp, video_timebase))
-            .chain(
-                audio_volume
-                    .iter()
-                    .map(|av| pts_to_microseconds(av.timestamp, audio_timebase)),
-            )
-            .max()
-            .unwrap_or(0);
-
         Video {
             volumes: audio_volume
                 .into_iter()
@@ -84,7 +72,6 @@ impl From<VideoInfo> for Video {
             width,
             height,
             fps: frame_rate,
-            duration,
         }
     }
 }

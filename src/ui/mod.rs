@@ -13,10 +13,10 @@ use std::{
     io::{self, Write},
     iter::repeat,
     process,
-    sync::{Arc, Condvar, Mutex, RwLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::StreamExt;
 use tui::{
     backend::{Backend, CrosstermBackend},
@@ -28,7 +28,7 @@ use tui::{
 };
 
 use crate::{
-    video::{Clip, Video},
+    video::Clip,
     VideoConfig,
 };
 use textbox::{TextBox, TextBoxState};
@@ -169,7 +169,6 @@ async fn run_ui<B: Backend + Send + 'static>(
                             ui_data.send(msg)?;
                         }
                     } else if key.code == KeyCode::Esc && state.on_esc() {
-                        running = false;
                         ui_data.send(UiMessage::Halt).ok();
                         return Ok(());
                     } else if let KeyCode::Char(c) = key.code {
@@ -231,7 +230,7 @@ fn draw_ui(frame: &mut Frame<'_, impl Backend>, state: &mut DrawState) {
 
             // populate with clips
             let mut total_time = 0;
-            let indices = indices.read().unwrap();
+            let indices = indices.blocking_read();
             let rows = clips
                 .iter()
                 .enumerate()
@@ -431,11 +430,11 @@ impl DrawState {
 
     /// The "enter" key was pressed.
     fn on_enter(&mut self) -> Result<Option<UiMessage>> {
-        if let (UiDirective::Clips { clips, indices, .. }, Some(ts)) =
+        if let (UiDirective::Clips { indices, .. }, Some(ts)) =
             (&self.last_directive, self.table_state.as_mut())
         {
             let selected = ts.selected().unwrap();
-            let mut indices = indices.write().unwrap();
+            let mut indices = indices.blocking_write();
             if indices.contains(&selected) {
                 indices.remove(&selected);
             } else {
@@ -448,8 +447,8 @@ impl DrawState {
 
             // parse the values as floats
             let mut values = [0.0; 4];
-            for i in 0..4 {
-                let text = vc.textboxes[i].text();
+            for (i, tb) in vc.textboxes.iter_mut().enumerate() {
+                let text = tb.text();
                 let value = text
                     .parse::<f64>()
                     .map_err(|_| anyhow!("could not parse {} as a float", text))?;
@@ -512,9 +511,8 @@ impl DrawState {
 
     /// Backspace was pressed.
     fn on_backspace(&mut self) {
-        match self.last_directive {
-            UiDirective::ModifyVideoConfig(_) => self.video_config.as_mut().unwrap().on_backspace(),
-            _ => (),
+        if let UiDirective::ModifyVideoConfig(_) = &self.last_directive {
+            self.video_config.as_mut().unwrap().on_backspace();
         }
     }
 }
@@ -577,7 +575,7 @@ impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // value is in microseconds
         let mut value = self.0;
-        let microseconds = value % 1000;
+        let _microseconds = value % 1000;
         value /= 1000;
         let milliseconds = value % 1000;
         value /= 1000;

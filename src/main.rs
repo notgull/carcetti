@@ -7,18 +7,17 @@
 use anyhow::{anyhow, Result};
 use std::{
     collections::HashSet,
-    env, fs, mem,
-    path::{Path, PathBuf},
+    env, mem,
+    path::PathBuf,
     process::{self, Stdio},
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
 use tempdir::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    spawn,
-    sync::{broadcast, mpsc},
+    sync::{RwLock, broadcast, mpsc},
     task::{JoinError, JoinHandle},
     time::interval,
 };
@@ -238,7 +237,7 @@ async fn make_melt_xml(
         .ok_or_else(|| anyhow!("Please provide a video output path"))?;
     let melt_path = tempdir.path().join("assembly.xml");
 
-    let indices = used_indices.read().unwrap();
+    let indices = used_indices.read().await;
     let duration = clips
         .iter()
         .enumerate()
@@ -410,7 +409,7 @@ async fn sort_video_clips(
     let time_limit = config.time_limit;
     let handle = tokio::task::spawn_blocking(move || sort_clips::sort_clips(&clips, time_limit));
 
-    Ok(finish_task(handle, ui_data).await?)
+    finish_task(handle, ui_data).await
 }
 
 /// Begin a message that has an ellipses after it.

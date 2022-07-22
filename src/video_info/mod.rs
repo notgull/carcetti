@@ -1,11 +1,11 @@
 // GNU AGPL v3 License
 
 use anyhow::{anyhow, Context as _, Result};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use ffmpeg::{
     decoder::{Audio as AudioDecoder, Video as VideoDecoder},
     encoder::Audio as AudioEncoder,
-    format::{context::Input, output, Output, Pixel},
+    format::{context::Input, output, Pixel},
     frame::{Audio, Video},
     media::Type,
     packet::Packet,
@@ -13,18 +13,12 @@ use ffmpeg::{
         resampling::Context as RContext,
         scaling::{Context, Flags},
     },
-    ChannelLayout, Rational, Stream,
+    ChannelLayout, Rational,
 };
 use image::RgbImage;
 use std::{
-    ffi::CString,
     fmt, mem,
-    ops::Deref,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
-        Arc,
-    },
     thread::{self, JoinHandle},
 };
 
@@ -77,7 +71,7 @@ pub(crate) fn video_info(path: impl AsRef<Path>, audio_output: PathBuf) -> Resul
     let mut video_handles = vec![];
 
     // spawn a thread to decode video packets
-    let mut video_decoder = video.codec().decoder().video()?;
+    let video_decoder = video.codec().decoder().video()?;
     let (width, height) = (video_decoder.width(), video_decoder.height());
     let fps = video_decoder
         .frame_rate()
@@ -136,7 +130,7 @@ pub(crate) fn video_info(path: impl AsRef<Path>, audio_output: PathBuf) -> Resul
     mem::drop((send_audio_packets, send_video_packets));
 
     // join the threads
-    let mut motions = video_handles
+    let motions = video_handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
         .flat_map(|res| match res {
@@ -147,7 +141,7 @@ pub(crate) fn video_info(path: impl AsRef<Path>, audio_output: PathBuf) -> Resul
             }
         })
         .collect::<Vec<_>>();
-    let mut volumes = audio_handles
+    let volumes = audio_handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
         .flat_map(|res| match res {
@@ -181,9 +175,6 @@ fn spawn_video_thread(
     mut video_decoder: VideoDecoder,
     recv_video_packets: &Receiver<Packet>,
 ) -> Result<JoinHandle<Result<Vec<ImageMotion>>>> {
-    static ID: AtomicUsize = AtomicUsize::new(0);
-    let id = ID.fetch_add(1, Relaxed);
-
     // create the decoder
     let recv_video_packets = recv_video_packets.clone();
 
@@ -237,9 +228,6 @@ fn spawn_audio_thread(
     recv_video_packets: &Receiver<Packet>,
     send_encoded_audio_packets: Sender<Audio>,
 ) -> Result<JoinHandle<Result<Vec<AudioVolume>>>> {
-    static ID: AtomicUsize = AtomicUsize::new(0);
-    let id = ID.fetch_add(1, Relaxed);
-
     // create the decoder
     let recv_audio_packets = recv_video_packets.clone();
 
@@ -406,12 +394,6 @@ pub(crate) struct ImageMotion {
 pub(crate) struct AudioVolume {
     pub(crate) timestamp: i64,
     pub(crate) average_volume: f64,
-}
-
-#[derive(Clone)]
-pub(crate) struct Cframe {
-    pub(crate) average_volume: usize,
-    pub(crate) motion: ImageMotion,
 }
 
 fn handle_video_decoding(

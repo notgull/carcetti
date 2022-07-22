@@ -2,7 +2,7 @@
 
 use super::PlaylistItem;
 use quick_xml::events::{attributes::Attribute, BytesEnd, BytesStart, Event};
-use std::{borrow::Cow::Borrowed, iter};
+use std::iter;
 
 /// XML events that are used to represent a playlist.
 pub(super) fn playlist_xml<'a>(

@@ -3,7 +3,6 @@
 use super::Video;
 use anyhow::Result;
 use fastrand::Rng;
-use rayon::prelude::*;
 use std::cmp;
 
 /// A clip in a video.

@@ -1,9 +1,7 @@
 // GNU AGPL v3 License
 
 use super::UiDirective;
-use sharded_slab::Slab;
 use std::{
-    iter::empty,
     mem,
     sync::{Arc, Mutex},
 };
@@ -44,13 +42,13 @@ impl Subscriber for UiSubscriber {
         metadata.level() <= &self.cur_level
     }
 
-    fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
         Id::from_u64(1)
     }
 
-    fn record(&self, span: &span::Id, values: &span::Record<'_>) {}
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
 
-    fn record_follows_from(&self, span: &span::Id, follows: &span::Id) {}
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
 
     fn event(&self, event: &tracing::Event<'_>) {
         let md = event.metadata();
@@ -72,7 +70,6 @@ impl Subscriber for UiSubscriber {
             Level::INFO => Span::styled("INFO  ", Style::default().fg(Color::Green)),
             Level::DEBUG => Span::styled("DEBUG ", Style::default().fg(Color::Cyan)),
             Level::TRACE => Span::styled("TRACE ", Style::default().fg(Color::Blue)),
-            _ => unreachable!(),
         };
 
         // add a span for the event bod
@@ -107,9 +104,9 @@ impl Subscriber for UiSubscriber {
         }
     }
 
-    fn enter(&self, span: &span::Id) {}
+    fn enter(&self, _span: &span::Id) {}
 
-    fn exit(&self, span: &span::Id) {}
+    fn exit(&self, _span: &span::Id) {}
 }
 
 struct BufferVisitor<'a> {
@@ -117,7 +114,7 @@ struct BufferVisitor<'a> {
 }
 
 impl<'a> Visit for BufferVisitor<'a> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, _field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         self.buffer.push_str(&format!("{:?} ", value));
     }
 }

@@ -2,8 +2,7 @@
 
 use super::video::Video;
 use anyhow::Result;
-use camino::{Utf8Path, Utf8PathBuf};
-use core::num;
+use camino::Utf8Path;
 use quick_xml::{
     events::{attributes::Attribute, BytesDecl, BytesEnd, BytesStart, Event},
     Writer,
@@ -11,7 +10,7 @@ use quick_xml::{
 use std::{
     convert::TryInto,
     fs, io,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 mod playlist;
@@ -181,5 +180,6 @@ pub(crate) enum PlaylistItem<'a> {
     /// An entry referring to another entry.
     Entry { id: &'a str, start: i64, end: i64 },
     /// A blank entry.
+    #[allow(dead_code)]
     Blank(i64),
 }
